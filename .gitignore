@@ -6,7 +6,8 @@
 
 # Frontend
 /go-backend/web/node_modules/
-/go-backend/web/dist/
+# dist TIDAK di-ignore: hasil build web ikut ter-commit agar repo berisi
+# web jadi yang disajikan wa.clipku.com (keputusan 11 Nov 2026).
 
 # Environment
 .env
