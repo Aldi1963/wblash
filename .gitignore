@@ -1,0 +1,42 @@
+# Go
+/go-backend/bin/
+/go-backend/wa-sessions/
+/go-backend/public/uploads/*
+!/go-backend/public/uploads/.gitkeep
+
+# Frontend
+/go-backend/web/node_modules/
+/go-backend/web/dist/
+
+# Environment
+.env
+.env.local
+.env.production
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database
+*.db
+*.sqlite
+
+# Logs
+*.log
+
+# Binary
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Local deploy only (secrets + nginx-served build copy)
+/go-backend/docker-compose.override.yml
+/go-backend/web-dist-static/
