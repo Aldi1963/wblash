@@ -68,6 +68,10 @@ func NewRouter(cfg *config.Config, db *gorm.DB, waManager *whatsapp.Manager) *gi
 		// JANGAN pindahkan ke grup protected: platform luar tidak punya sesi user.
 		registerIntegrationInboxRoute(api, db, waManager)
 
+		// Inbound webhook (Item 8) — publik, auth via HMAC/secret (bukan auth user).
+		// JANGAN pindahkan ke grup protected: platform luar tidak punya sesi user.
+		registerInboundWebhookRoute(api, db, waManager)
+
 		// Webhook Clipku Pay — publik, diverifikasi via X-Signature
 		api.POST("/billing/clipkupay/webhook", clipkuPayWebhook(cfg, db, waManager))
 
@@ -89,6 +93,7 @@ func NewRouter(cfg *config.Config, db *gorm.DB, waManager *whatsapp.Manager) *gi
 			registerAutoReplyRoutes(protected, db)
 			registerAIReplyRoutes(protected, db)
 			registerAIConnectionRoutes(protected, db)
+			registerAIChatbotRoutes(protected, db)
 			registerMenuBotRoutes(protected, db)
 			registerIntegrationRoutes(protected, db, waManager)
 			registerApiKeyRoutes(protected, db)
@@ -96,14 +101,16 @@ func NewRouter(cfg *config.Config, db *gorm.DB, waManager *whatsapp.Manager) *gi
 			registerScheduleRoutes(protected, db)
 			registerScheduleAliasRoutes(protected, db)
 			registerWebhookRoutes(protected, db)
+			registerSheetsWebhookRoutes(protected, db, waManager)
 			registerPluginRoutes(protected, db)
-			registerTemplateRoutes(protected, db)
+			registerTemplateRoutes(protected, db, waManager)
 			registerCsBotRoutes(protected, cfg, db)
 			registerAntiBannedRoutes(protected, db, waManager)
 			registerNotificationRoutes(protected, db)
 			registerUploadRoutes(protected)
 			InitLiveChat(cfg, db, waManager)
 			registerChatRoutes(protected, db, waManager)
+			registerChatBackupRoutes(protected, db)
 			registerAnalyticsRoutes(protected, db)
 			registerStatsRoutes(protected, db)
 			registerDripRoutes(protected, db)
@@ -134,6 +141,9 @@ func NewRouter(cfg *config.Config, db *gorm.DB, waManager *whatsapp.Manager) *gi
 			admin.Use(middleware.AdminRequired())
 			{
 				registerAdminRoutes(admin, cfg, db, waManager)
+				// Analitik voucher (Item 7): statistik per kode + riwayat penukaran.
+				admin.GET("/vouchers/analytics", adminVoucherAnalytics(db))
+				admin.GET("/vouchers/:id/redemptions", adminListVoucherRedemptions(db))
 			}
 		}
 	}

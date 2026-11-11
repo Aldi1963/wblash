@@ -10,10 +10,12 @@ const DashboardLayoutLazy = lazy(() =>
 );
 import { PageTransitionLoader } from "@/components/ui/page-transition";
 import { Toaster } from "sonner";
+import { consumePostLoginRedirect } from "@/lib/post-login-redirect";
 
 // ── Lazy Pages ────────────────────────────────────────────────────────────────
 const Login = lazy(() => import("@/pages/Login"));
 const Register = lazy(() => import("@/pages/Register"));
+const Redeem = lazy(() => import("@/pages/Redeem"));
 const OAuthCallback = lazy(() => import("@/pages/OAuthCallback"));
 const ForgotPassword = lazy(() => import("@/pages/ForgotPassword"));
 const ResetPassword = lazy(() => import("@/pages/ResetPassword"));
@@ -23,9 +25,11 @@ const History = lazy(() => import("@/pages/History"));
 const ScheduleHub = lazy(() => import("@/pages/ScheduleHub"));
 const ContactsHub = lazy(() => import("@/pages/ContactsHub"));
 const AutomationHub = lazy(() => import("@/pages/AutomationHub"));
+const CatalogOrder = lazy(() => import("@/pages/CatalogOrder"));
 const ReportHub = lazy(() => import("@/pages/ReportHub"));
 const DeveloperHub = lazy(() => import("@/pages/DeveloperHub"));
 const LiveChatHub = lazy(() => import("@/pages/LiveChatHub"));
+const ChatBackup = lazy(() => import("@/pages/ChatBackup"));
 const FileManager = lazy(() => import("@/pages/FileManager"));
 const Links = lazy(() => import("@/pages/Links"));
 const Admin = lazy(() => import("@/pages/Admin"));
@@ -94,7 +98,11 @@ function HomeRoute() {
 function GuestRoute({ children }: { children: React.ReactNode }) {
   const { user, isLoading } = useAuth();
   if (isLoading) return null;
-  if (user) return <Redirect to="/" />;
+  if (user) {
+    // Login/register berhasil: kembali ke target yang disimpan halaman
+    // tujuan (mis. /redeem?code=XXX), bila ada; kalau tidak, ke dashboard.
+    return <Redirect to={consumePostLoginRedirect() ?? "/"} />;
+  }
   return <>{children}</>;
 }
 
@@ -115,6 +123,9 @@ function AppRouter() {
         </Route>
         <Route path="/register">
           <GuestRoute><Register /></GuestRoute>
+        </Route>
+        <Route path="/redeem">
+          <Redeem />
         </Route>
         <Route path="/forgot-password">
           <GuestRoute><ForgotPassword /></GuestRoute>
@@ -170,6 +181,9 @@ function AppRouter() {
         <Route path="/menu-bot">
           <ProtectedRoute><AutomationHub /></ProtectedRoute>
         </Route>
+        <Route path="/catalog-order">
+          <ProtectedRoute><CatalogOrder /></ProtectedRoute>
+        </Route>
         <Route path="/ai-reply">
           <ProtectedRoute><AutomationHub /></ProtectedRoute>
         </Route>
@@ -181,6 +195,9 @@ function AppRouter() {
         </Route>
         <Route path="/chat-labels">
           <ProtectedRoute><LiveChatHub /></ProtectedRoute>
+        </Route>
+        <Route path="/chat-backups">
+          <ProtectedRoute><ChatBackup /></ProtectedRoute>
         </Route>
         <Route path="/reports">
           <ProtectedRoute><ReportHub /></ProtectedRoute>
@@ -195,6 +212,9 @@ function AppRouter() {
           <ProtectedRoute><DeveloperHub /></ProtectedRoute>
         </Route>
         <Route path="/webhook-logs">
+          <ProtectedRoute><DeveloperHub /></ProtectedRoute>
+        </Route>
+        <Route path="/sheets-webhook">
           <ProtectedRoute><DeveloperHub /></ProtectedRoute>
         </Route>
         <Route path="/integrations">

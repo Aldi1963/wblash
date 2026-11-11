@@ -29,7 +29,10 @@ import {
   EyeOff,
   KeyRound,
   Copy,
+  Link2,
   CreditCard,
+  AlertTriangle,
+  History,
 } from "lucide-react";
 import {
   ResponsiveContainer,
@@ -71,7 +74,22 @@ interface Pkg {
   maxDevices: number;
   maxMessages: number;
   maxContacts: number;
+  maxBulk: number;
+  maxAutoReply: number;
   isActive: boolean;
+}
+
+interface BulkFailure {
+  code: string;
+  reason: string;
+}
+
+interface BulkResult {
+  created: Voucher[];
+  failed: BulkFailure[];
+  createdCount: number;
+  failedCount: number;
+  total: number;
 }
 
 interface Voucher {
@@ -79,12 +97,49 @@ interface Voucher {
   code: string;
   type: string;
   planId?: number | null;
+  minPlanId?: number | null;
   duration: number;
   discount: number;
   maxUses: number;
   usedCount: number;
+  newUsersOnly?: boolean;
   isActive: boolean;
   expiresAt?: string | null;
+  source?: string;
+  startsAt?: string | null;
+  endsAt?: string | null;
+}
+
+// Analitik voucher (Item 7): statistik per kode + ringkasan konversi
+// trial→berbayar, dari GET /api/admin/vouchers/analytics.
+interface VoucherAnalyticsRow {
+  voucherId: number;
+  code: string;
+  type: string;
+  planName: string;
+  redemptions: number;
+  convertedCount: number;
+  conversionRate: number;
+  firstRedeemedAt?: string | null;
+  lastRedeemedAt?: string | null;
+}
+
+interface VoucherAnalyticsSummary {
+  totalVouchers: number;
+  totalRedemptions: number;
+  trialRedemptions: number;
+  trialConverted: number;
+  trialConversionRate: number;
+}
+
+interface VoucherRedemptionItem {
+  id: number;
+  userId: number;
+  userName: string;
+  userEmail: string;
+  redeemedAt: string;
+  converted: boolean;
+  firstPaidAt?: string | null;
 }
 
 interface Txn {
@@ -159,12 +214,14 @@ function Select({
   options,
   className,
   ariaLabel,
+  disabled,
 }: {
   value: string;
   onChange: (v: string) => void;
   options: { value: string; label: string }[];
   className?: string;
   ariaLabel?: string;
+  disabled?: boolean;
 }) {
   return (
     <Dropdown
@@ -173,6 +230,7 @@ function Select({
       options={options}
       className={className}
       ariaLabel={ariaLabel}
+      disabled={disabled}
     />
   );
 }
@@ -829,7 +887,7 @@ function UsersTab() {
 
 /* ── Tab: Paket ─────────────────────────────────────── */
 
-const emptyPkg = { name: "", slug: "", price: "", duration: "30", maxDevices: "1", maxMessages: "1000", maxContacts: "100", isActive: true };
+const emptyPkg = { name: "", slug: "", price: "", duration: "30", maxDevices: "1", maxMessages: "1000", maxContacts: "100", maxBulk: "100", maxAutoReply: "5", isActive: true };
 
 function PackagesTab() {
   const { t } = useLang();
@@ -872,6 +930,8 @@ function PackagesTab() {
       maxDevices: String(p.maxDevices),
       maxMessages: String(p.maxMessages),
       maxContacts: String(p.maxContacts),
+      maxBulk: String(p.maxBulk ?? 0),
+      maxAutoReply: String(p.maxAutoReply ?? 0),
       isActive: p.isActive,
     });
     setEditing(p);
@@ -893,6 +953,11 @@ function PackagesTab() {
         max_devices: Number(form.maxDevices) || 1,
         max_messages: Number(form.maxMessages) || 0,
         max_contacts: Number(form.maxContacts) || 0,
+        // Field baru pakai camelCase agar ter-bind ke model Go (tag json
+        // camelCase) saat membuat paket baru; update paket memakai map
+        // dan GORM memetakan nama field ke kolom.
+        maxBulk: Number(form.maxBulk) || 0,
+        maxAutoReply: Number(form.maxAutoReply) || 0,
         is_active: form.isActive,
       };
       if (editing) {
@@ -964,7 +1029,9 @@ function PackagesTab() {
                       {t("admin.packageLimits")
                           .replace("{devices}", String(fmtNum(p.maxDevices)))
                           .replace("{messages}", String(fmtNum(p.maxMessages)))
-                          .replace("{contacts}", String(fmtNum(p.maxContacts)))}
+                          .replace("{contacts}", String(fmtNum(p.maxContacts)))
+                          .replace("{bulk}", String(fmtNum(p.maxBulk ?? 0)))
+                          .replace("{autoReply}", String(fmtNum(p.maxAutoReply ?? 0)))}
                     </td>
                     <td className="p-3">
                       {p.isActive ? (
@@ -1028,6 +1095,14 @@ function PackagesTab() {
                 <Input type="number" min="0" value={form.maxContacts} onChange={(e) => set("maxContacts", e.target.value)} />
               </Field>
             </div>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label={t("admin.maxBulkLabel")}>
+                <Input type="number" min="0" value={form.maxBulk} onChange={(e) => set("maxBulk", e.target.value)} />
+              </Field>
+              <Field label={t("admin.maxAutoReplyLabel")}>
+                <Input type="number" min="0" value={form.maxAutoReply} onChange={(e) => set("maxAutoReply", e.target.value)} />
+              </Field>
+            </div>
             <label className="flex items-center gap-2 text-sm text-foreground cursor-pointer">
               <input type="checkbox" checked={form.isActive} onChange={(e) => set("isActive", e.target.checked)} className="w-4 h-4 accent-primary" />
               {t("admin.packageActiveLabel")}
@@ -1074,42 +1149,120 @@ function VouchersTab() {
   const [vouchers, setVouchers] = useState<Voucher[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [analytics, setAnalytics] = useState<VoucherAnalyticsSummary | null>(null);
+  const [statsById, setStatsById] = useState<Record<number, VoucherAnalyticsRow>>({});
+  const [historyVoucher, setHistoryVoucher] = useState<Voucher | null>(null);
+  const [history, setHistory] = useState<VoucherRedemptionItem[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
   const [showForm, setShowForm] = useState(false);
   const [code, setCode] = useState("");
   const [type, setType] = useState("trial");
   const [planId, setPlanId] = useState("");
+  const [minPlanId, setMinPlanId] = useState("");
   const [plans, setPlans] = useState<Pkg[]>([]);
   const [duration, setDuration] = useState("7");
   const [maxUses, setMaxUses] = useState("100");
+  const [startsAt, setStartsAt] = useState("");
+  const [endsAt, setEndsAt] = useState("");
+  const [newUsersOnly, setNewUsersOnly] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [editing, setEditing] = useState<Voucher | null>(null);
+  const [editIsActive, setEditIsActive] = useState(true);
+  const [editExpiresAt, setEditExpiresAt] = useState("");
   const [deleting, setDeleting] = useState<Voucher | null>(null);
   const [deletingBusy, setDeletingBusy] = useState(false);
+  // Mode massal: buat banyak kode sekaligus dengan satu prefix.
+  const [bulkMode, setBulkMode] = useState(false);
+  const [prefix, setPrefix] = useState("");
+  const [count, setCount] = useState("10");
+  const [bulkResult, setBulkResult] = useState<BulkResult | null>(null);
+
+  // Voucher yang sudah dipakai mengunci kode/tipe/paket/durasi/maks pakai
+  // (backend menolak 400 bila dikirim berubah); status aktif dan tanggal
+  // berakhir tetap bisa diubah.
+  const editingUsed = (editing?.usedCount ?? 0) > 0;
+  // Opsi diskon hanya tampil bila voucher yang diedit memang bertipe
+  // diskon (legacy) — tipe diskon sudah dihapus dari admin, tidak bisa
+  // dipilih untuk voucher baru.
+  const editTypeOptions =
+    editing?.type === "discount"
+      ? [...VOUCHER_TYPES, { value: "discount", label: t("settings.voucherTypeDiscount") }]
+      : VOUCHER_TYPES;
 
   const load = () => {
     setLoading(true);
     setError(null);
-    apiGet<{ vouchers: Voucher[] }>("/admin/vouchers")
-      .then((res) => setVouchers(res.vouchers || []))
+    // Analitik dimuat berdampingan; bila gagal, tabel tetap tampil
+    // (kolom konversi jadi "—") dan toast tidak diperlukan.
+    Promise.all([
+      apiGet<{ vouchers: Voucher[] }>("/admin/vouchers"),
+      apiGet<{ summary: VoucherAnalyticsSummary; vouchers: VoucherAnalyticsRow[] }>(
+        "/admin/vouchers/analytics",
+      ).catch(() => null),
+    ])
+      .then(([vRes, aRes]) => {
+        setVouchers(vRes.vouchers || []);
+        if (aRes) {
+          setAnalytics(aRes.summary);
+          const map: Record<number, VoucherAnalyticsRow> = {};
+          for (const row of aRes.vouchers || []) map[row.voucherId] = row;
+          setStatsById(map);
+        }
+      })
       .catch((e) => setError(errMsg(e, t("admin.errLoadVouchers"))))
       .finally(() => setLoading(false));
+    // Daftar paket juga dipakai untuk menampilkan nama paket minimal di tabel.
+    apiGet<{ packages: Pkg[] }>("/admin/packages")
+      .then((res) => setPlans(res.packages || []))
+      .catch(() => setPlans([]));
   };
 
   useEffect(load, []);
 
-  // Muat daftar paket saat form tambah dibuka (untuk dropdown paket).
+  // Muat riwayat penukaran saat modal dibuka.
+  const loadHistory = (v: Voucher) => {
+    setHistoryLoading(true);
+    setHistoryError(null);
+    apiGet<{ redemptions: VoucherRedemptionItem[] }>(
+      `/admin/vouchers/${v.id}/redemptions`,
+    )
+      .then((res) => setHistory(res.redemptions || []))
+      .catch((e) => setHistoryError(errMsg(e, t("admin.errLoadVoucherHistory"))))
+      .finally(() => setHistoryLoading(false));
+  };
+
   useEffect(() => {
-    if (!showForm) return;
+    if (!historyVoucher) return;
+    loadHistory(historyVoucher);
+  }, [historyVoucher]);
+
+  // Muat daftar paket saat form tambah/edit dibuka (untuk dropdown paket).
+  useEffect(() => {
+    if (!showForm && !editing) return;
     apiGet<{ packages: Pkg[] }>("/admin/packages")
       .then((res) => setPlans(res.packages || []))
       .catch(() => setPlans([]));
-  }, [showForm]);
+  }, [showForm, editing]);
 
   const resetForm = () => {
     setCode("");
     setType("trial");
     setPlanId("");
+    setMinPlanId("");
     setDuration("7");
     setMaxUses("100");
+    setPrefix("");
+    setCount("10");
+    setBulkResult(null);
+    setStartsAt("");
+    setEndsAt("");
+    setNewUsersOnly(false);
+  };
+
+  const closeForm = () => {
+    setShowForm(false);
+    resetForm();
   };
 
   const handleAdd = async () => {
@@ -1121,6 +1274,10 @@ function VouchersTab() {
       toast.error(t("admin.errVoucherPlan"));
       return;
     }
+    if (startsAt && endsAt && new Date(endsAt) <= new Date(startsAt)) {
+      toast.error(t("admin.errVoucherSchedule"));
+      return;
+    }
     setSaving(true);
     try {
       const body: Record<string, unknown> = {
@@ -1128,8 +1285,16 @@ function VouchersTab() {
         type,
         duration: Number(duration) || 0,
         max_uses: Number(maxUses) || 1,
+        newUsersOnly,
       };
       if (type === "plan" && planId.trim()) body.plan_id = Number(planId);
+      // Kunci camelCase supaya ter-bind ke tag JSON model Voucher
+      // (encoding/json tidak mengenali snake_case seperti starts_at).
+      if (startsAt) body.startsAt = new Date(startsAt).toISOString();
+      if (endsAt) body.endsAt = new Date(endsAt).toISOString();
+      // camelCase: binding JSON backend memakai tag json model (minPlanId);
+      // kunci snake_case (min_plan_id) diam-diam diabaikan decoder.
+      if (minPlanId.trim()) body.minPlanId = Number(minPlanId);
       await apiPost("/admin/vouchers", body);
       toast.success(t("admin.voucherCreated"));
       setShowForm(false);
@@ -1137,6 +1302,41 @@ function VouchersTab() {
       load();
     } catch (e) {
       toast.error(errMsg(e, t("admin.errCreateVoucher")));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleBulk = async () => {
+    if (!prefix.trim()) {
+      toast.error(t("admin.errVoucherPrefix"));
+      return;
+    }
+    const n = Number(count);
+    if (!Number.isInteger(n) || n < 1 || n > 500) {
+      toast.error(t("admin.errVoucherCount"));
+      return;
+    }
+    if (type === "plan" && !planId.trim()) {
+      toast.error(t("admin.errVoucherPlan"));
+      return;
+    }
+    setSaving(true);
+    try {
+      const body: Record<string, unknown> = {
+        prefix: prefix.trim().toUpperCase(),
+        count: n,
+        type,
+        duration: Number(duration) || 0,
+        max_uses: Number(maxUses) || 1,
+      };
+      if (type === "plan" && planId.trim()) body.plan_id = Number(planId);
+      const res = await apiPost<BulkResult>("/admin/vouchers/bulk", body);
+      setBulkResult(res);
+      toast.success(t("admin.bulkVoucherCreated"));
+      load();
+    } catch (e) {
+      toast.error(errMsg(e, t("admin.errCreateBulkVoucher")));
     } finally {
       setSaving(false);
     }
@@ -1157,17 +1357,147 @@ function VouchersTab() {
     }
   };
 
+  const openEdit = (v: Voucher) => {
+    setCode(v.code);
+    setType(v.type);
+    setPlanId(v.planId ? String(v.planId) : "");
+    setDuration(String(v.duration));
+    setMaxUses(String(v.maxUses));
+    setEditIsActive(v.isActive);
+    setEditExpiresAt(v.expiresAt ? v.expiresAt.slice(0, 10) : "");
+    setEditing(v);
+  };
+
+  const handleSaveEdit = async () => {
+    if (!editing) return;
+    if (!code.trim()) {
+      toast.error(t("admin.errVoucherCode"));
+      return;
+    }
+    if (type === "plan" && !planId.trim()) {
+      toast.error(t("admin.errVoucherPlan"));
+      return;
+    }
+    setSaving(true);
+    try {
+      // Key camelCase agar ter-bind ke model Go (snake_case tidak ter-bind).
+      const body: Record<string, unknown> = {
+        code: code.trim().toUpperCase(),
+        type,
+        planId: planId.trim() ? Number(planId) : null,
+        duration: Number(duration) || 0,
+        maxUses: Number(maxUses) || 1,
+        isActive: editIsActive,
+        expiresAt: editExpiresAt ? new Date(`${editExpiresAt}T00:00:00`).toISOString() : null,
+      };
+      await apiPut(`/admin/vouchers/${editing.id}`, body);
+      toast.success(t("admin.voucherUpdated"));
+      setEditing(null);
+      load();
+    } catch (e) {
+      toast.error(errMsg(e, t("admin.errUpdateVoucher")));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // Link redeem yang bisa dibagikan: dibuka dari luar, kode sudah terisi
+  // di halaman /redeem (pengguna diminta login dulu bila belum login).
+  const copyRedeemLink = async (v: Voucher) => {
+    const url = `${window.location.origin}/redeem?code=${encodeURIComponent(v.code)}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      toast.success(t("admin.linkCopied"));
+    } catch {
+      toast.error(t("admin.errCopyLink"));
+    }
+  };
+
   const typeLabel = (tv: string) => VOUCHER_TYPES.find((x) => x.value === tv)?.label || tv;
+
+  // Peringatan stok & kedaluwarsa (Item 8): pemakaian >= 90% dari MaxUses
+  // dianggap hampir habis; ExpiresAt yang lewat berarti kedaluwarsa
+  // (job per jam + lazy-expiry di GET /admin/vouchers menonaktifkannya).
+  const usageRatio = (v: Voucher) => (v.maxUses > 0 ? v.usedCount / v.maxUses : 0);
+  const isExpired = (v: Voucher) =>
+    (!!v.expiresAt && new Date(v.expiresAt).getTime() <= Date.now()) ||
+    (!!v.endsAt && new Date(v.endsAt).getTime() <= Date.now());
+  const isNearlyUsed = (v: Voucher) => {
+    const r = usageRatio(v);
+    return r >= 0.9 && r < 1;
+  };
+  const isUsedUp = (v: Voucher) => usageRatio(v) >= 1;
+  const alertCounts = useMemo(
+    () => ({
+      lowStock: vouchers.filter((v) => usageRatio(v) >= 0.9).length,
+      expired: vouchers.filter(isExpired).length,
+    }),
+    [vouchers],
+  );
+
+  // Label jendela berlaku: "mulai – berakhir", sisi yang kosong jadi "…".
+  const scheduleLabel = (v: Voucher) => {
+    if (!v.startsAt && !v.endsAt) return "-";
+    const s = v.startsAt ? fmtDate(v.startsAt) : "…";
+    const e = v.endsAt ? fmtDate(v.endsAt) : "…";
+    return `${s} – ${e}`;
+  };
+
+  // Status jendela: di luar jendela voucher tidak bisa ditukar walau aktif.
+  const scheduleState = (v: Voucher) => {
+    const now = Date.now();
+    if (v.startsAt && new Date(v.startsAt).getTime() > now) return "upcoming";
+    if (v.endsAt && new Date(v.endsAt).getTime() < now) return "ended";
+    return null;
+  };
 
   const planOptions = [
     { value: "", label: t("admin.selectPackage") },
     ...plans.map((p) => ({ value: String(p.id), label: `${p.name} — ${fmtRp(p.price)}` })),
   ];
 
+  // Pratinjau live: hanya membaca state form (tanpa API baru).
+  const previewCode = code.trim().toUpperCase() || "—";
+  const previewDaysNum = Number(duration);
+  const previewDays = previewDaysNum > 0 ? String(previewDaysNum) : "—";
+  const previewUsesNum = Number(maxUses);
+  const previewUses = previewUsesNum > 0 ? fmtNum(previewUsesNum) : "—";
+  const previewPlan = plans.find((p) => String(p.id) === planId);
+  const previewSummary =
+    type === "plan"
+      ? t("admin.voucherPreviewPlan")
+          .replace("{code}", previewCode)
+          .replace("{plan}", previewPlan ? previewPlan.name : "—")
+          .replace("{days}", previewDays)
+          .replace("{uses}", previewUses)
+      : t("admin.voucherPreviewTrial")
+          .replace("{code}", previewCode)
+          .replace("{days}", previewDays)
+          .replace("{uses}", previewUses);
+
+  const fmtPct = (n: number) => `${Number(n.toFixed(1))}%`;
+
+  // Kartu ringkasan analitik (pola yang sama seperti tab Overview).
+  const voucherStats = analytics
+    ? [
+        { icon: Ticket, label: t("admin.statTotalVouchers"), value: fmtNum(analytics.totalVouchers), tint: "bg-violet-500/10 text-violet-600" },
+        { icon: Users, label: t("admin.statTotalRedemptions"), value: fmtNum(analytics.totalRedemptions), tint: "bg-emerald-500/10 text-emerald-600" },
+        { icon: Smartphone, label: t("admin.statTrialRedemptions"), value: fmtNum(analytics.trialRedemptions), tint: "bg-amber-500/10 text-amber-600" },
+        { icon: Wallet, label: t("admin.statTrialConversion"), value: `${fmtNum(analytics.trialConverted)} (${fmtPct(analytics.trialConversionRate)})`, tint: "bg-[#243370]/10 text-[#243370] dark:text-[#8fa0e8]" },
+      ]
+    : [];
+  const minPlanOptions = [
+    { value: "", label: t("admin.voucherMinPlanAll") },
+    ...plans.map((p) => ({ value: String(p.id), label: `${p.name} — ${fmtRp(p.price)}` })),
+  ];
+
+  const minPlanName = (id?: number | null) =>
+    plans.find((p) => p.id === id)?.name || null;
+
   return (
     <div className="space-y-4">
       <div className="flex justify-end">
-        <Button size="sm" className="gap-1.5" onClick={() => setShowForm(true)}>
+        <Button size="sm" className="gap-1.5" onClick={() => { setBulkResult(null); setShowForm(true); }}>
           <Plus className="w-3.5 h-3.5" /> {t("admin.addVoucher")}
         </Button>
       </div>
@@ -1175,18 +1505,55 @@ function VouchersTab() {
       {loading && <LoadingRows />}
       {!loading && error && <ErrorCard message={error} onRetry={load} />}
 
+      {!loading && !error && (alertCounts.lowStock > 0 || alertCounts.expired > 0) && (
+        <div className="flex gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2.5 text-sm text-amber-700 dark:text-amber-300">
+          <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+          <div className="space-y-0.5">
+            {alertCounts.lowStock > 0 && (
+              <p>{t("admin.voucherAlertLowStock").replace("{count}", String(alertCounts.lowStock))}</p>
+            )}
+            {alertCounts.expired > 0 && (
+              <p>{t("admin.voucherAlertExpired").replace("{count}", String(alertCounts.expired))}</p>
+            )}
+          </div>
+        </div>
+      )}
+      {!loading && !error && voucherStats.length > 0 && (
+        <>
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+            {voucherStats.map((s) => (
+              <Card key={s.label}>
+                <CardContent className="p-4 flex items-center gap-3">
+                  <div className={`w-10 h-10 shrink-0 rounded-lg flex items-center justify-center ${s.tint}`}>
+                    <s.icon className="w-5 h-5" />
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-xs text-muted-foreground">{s.label}</p>
+                    <p className="text-lg font-bold text-foreground truncate">{s.value}</p>
+                  </div>
+                </CardContent>
+              </Card>
+            ))}
+          </div>
+          <p className="text-xs text-muted-foreground">{t("admin.trialConversionNote")}</p>
+        </>
+      )}
+
       {!loading && !error && (
         <Card>
           <div className="overflow-x-auto">
-            <table className="w-full text-sm min-w-[760px]">
+            <table className="w-full text-sm min-w-[880px]">
               <thead>
                 <tr className="border-b border-border text-left text-xs text-muted-foreground">
                   <th className="p-3 font-medium">{t("admin.colCode")}</th>
                   <th className="p-3 font-medium">{t("admin.colType")}</th>
+                  <th className="p-3 font-medium">{t("admin.colMinPlan")}</th>
                   <th className="p-3 font-medium">{t("admin.colDuration")}</th>
                   <th className="p-3 font-medium">{t("admin.colDiscount")}</th>
                   <th className="p-3 font-medium">{t("admin.colUsed")}</th>
+                  <th className="p-3 font-medium">{t("admin.colConversion")}</th>
                   <th className="p-3 font-medium">{t("admin.colExpires")}</th>
+                  <th className="p-3 font-medium">{t("admin.colSchedule")}</th>
                   <th className="p-3 font-medium">{t("admin.colStatus")}</th>
                   <th className="p-3 font-medium text-right">{t("admin.colActions")}</th>
                 </tr>
@@ -1194,33 +1561,85 @@ function VouchersTab() {
               <tbody>
                 {vouchers.map((v) => (
                   <tr key={v.id} className="border-b border-border last:border-0">
-                    <td className="p-3 font-mono font-semibold text-foreground">{v.code}</td>
+                    <td className="p-3 font-mono font-semibold text-foreground">
+                      {v.code}
+                      {v.source === "referral_reward" && (
+                        <Badge variant="outline" className="ml-2 align-middle">{t("admin.voucherReferralReward")}</Badge>
+                      )}
+                    </td>
                     <td className="p-3">
                       <Badge variant="outline">{typeLabel(v.type)}</Badge>
+                      {v.newUsersOnly && (
+                        <Badge variant="outline" className="ml-1 border-sky-500/30 text-sky-600">
+                          {t("admin.voucherNewUsersBadge")}
+                        </Badge>
+                      )}
+                    </td>
+                    <td className="p-3 whitespace-nowrap">
+                      {v.minPlanId ? (
+                        <Badge variant="outline">Min: {minPlanName(v.minPlanId) ?? `#${v.minPlanId}`}</Badge>
+                      ) : (
+                        <span className="text-muted-foreground">{t("admin.voucherMinPlanAll")}</span>
+                      )}
                     </td>
                     <td className="p-3 text-muted-foreground whitespace-nowrap">{t("admin.daysCount").replace("{count}", String(v.duration))}</td>
                     <td className="p-3 text-muted-foreground">{t("admin.discountPct").replace("{pct}", String(v.discount))}</td>
                     <td className="p-3 text-muted-foreground whitespace-nowrap">
                       {fmtNum(v.usedCount)} / {fmtNum(v.maxUses)}
-                    </td>
-                    <td className="p-3 text-xs text-muted-foreground whitespace-nowrap">{fmtDate(v.expiresAt)}</td>
-                    <td className="p-3">
-                      {v.isActive ? (
-                        <Badge className="bg-emerald-500/10 text-emerald-600 border-emerald-500/20">{t("admin.statusActive")}</Badge>
-                      ) : (
-                        <Badge variant="outline">{t("admin.statusInactive")}</Badge>
+                      {isUsedUp(v) && (
+                        <Badge className="ml-2 bg-red-500/10 text-red-600 border-red-500/20">{t("admin.voucherExhausted")}</Badge>
+                      )}
+                      {!isUsedUp(v) && isNearlyUsed(v) && (
+                        <Badge className="ml-2 bg-amber-500/10 text-amber-600 border-amber-500/20">{t("admin.voucherAlmostUsed")}</Badge>
                       )}
                     </td>
-                    <td className="p-3 text-right">
-                      <Button variant="ghost" size="icon" className="h-7 w-7 text-destructive" onClick={() => setDeleting(v)} aria-label={t("admin.deleteVoucher")}>
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </Button>
+                    <td className="p-3 text-muted-foreground whitespace-nowrap">
+                      {v.type === "trial" && statsById[v.id]
+                        ? t("admin.conversionDetail")
+                            .replace("{converted}", String(statsById[v.id].convertedCount))
+                            .replace("{total}", String(statsById[v.id].redemptions))
+                            .replace("{rate}", String(Number(statsById[v.id].conversionRate.toFixed(1))))
+                        : "—"}
+                    </td>
+                    <td className="p-3 text-xs text-muted-foreground whitespace-nowrap">{fmtDate(v.expiresAt)}</td>
+                    <td className="p-3 text-xs text-muted-foreground whitespace-nowrap">{scheduleLabel(v)}</td>
+                    <td className="p-3">
+                      <span className="inline-flex flex-wrap gap-1">
+                        {scheduleState(v) === "upcoming" ? (
+                          <Badge className="bg-amber-500/10 text-amber-600 border-amber-500/20">{t("admin.voucherNotYetValid")}</Badge>
+                        ) : scheduleState(v) === "ended" ? (
+                          <Badge variant="outline">{t("admin.voucherScheduleEnded")}</Badge>
+                        ) : v.isActive ? (
+                          <Badge className="bg-emerald-500/10 text-emerald-600 border-emerald-500/20">{t("admin.statusActive")}</Badge>
+                        ) : (
+                          <Badge variant="outline">{t("admin.statusInactive")}</Badge>
+                        )}
+                        {isExpired(v) && (
+                          <Badge className="bg-red-500/10 text-red-600 border-red-500/20">{t("admin.voucherExpired")}</Badge>
+                        )}
+                      </span>
+                    </td>
+                    <td className="p-3 text-right whitespace-nowrap">
+                      <div className="flex items-center justify-end gap-1">
+                        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openEdit(v)} aria-label={t("admin.editVoucher")}>
+                          <Pencil className="w-3.5 h-3.5" />
+                        </Button>
+                        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => setHistoryVoucher(v)} aria-label={t("admin.voucherHistory")}>
+                          <History className="w-3.5 h-3.5" />
+                        </Button>
+                        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => copyRedeemLink(v)} aria-label={t("admin.copyRedeemLink")}>
+                          <Link2 className="w-3.5 h-3.5" />
+                        </Button>
+                        <Button variant="ghost" size="icon" className="h-7 w-7 text-destructive" onClick={() => setDeleting(v)} aria-label={t("admin.deleteVoucher")}>
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </Button>
+                      </div>
                     </td>
                   </tr>
                 ))}
                 {vouchers.length === 0 && (
                   <tr>
-                    <td colSpan={8} className="p-8 text-center text-sm text-muted-foreground">
+                    <td colSpan={11} className="p-8 text-center text-sm text-muted-foreground">
                       {t("admin.noVouchers")}
                     </td>
                   </tr>
@@ -1232,11 +1651,30 @@ function VouchersTab() {
       )}
 
       {showForm && (
-        <Modal title={t("admin.addVoucherTitle")} onClose={() => setShowForm(false)}>
+        <Modal title={bulkMode ? t("admin.addBulkVoucherTitle") : t("admin.addVoucherTitle")} onClose={closeForm}>
           <div className="space-y-4">
-            <Field label={t("admin.voucherCodeLabel")}>
-              <Input value={code} onChange={(e) => setCode(e.target.value)} placeholder="cth: HEMAT50" className="font-mono uppercase" />
-            </Field>
+            <div className="flex gap-1 rounded-lg bg-muted p-1">
+              <Button variant={!bulkMode ? "default" : "ghost"} size="sm" className="flex-1" onClick={() => { setBulkMode(false); setBulkResult(null); }}>
+                {t("admin.bulkModeSingle")}
+              </Button>
+              <Button variant={bulkMode ? "default" : "ghost"} size="sm" className="flex-1" onClick={() => { setBulkMode(true); setBulkResult(null); }}>
+                {t("admin.bulkModeBulk")}
+              </Button>
+            </div>
+            {bulkMode ? (
+              <div className="grid grid-cols-2 gap-3">
+                <Field label={t("admin.voucherPrefixLabel")}>
+                  <Input value={prefix} onChange={(e) => setPrefix(e.target.value)} placeholder="cth: HEMAT50" className="font-mono uppercase" />
+                </Field>
+                <Field label={t("admin.voucherCountLabel")}>
+                  <Input type="number" min="1" max="500" value={count} onChange={(e) => setCount(e.target.value)} />
+                </Field>
+              </div>
+            ) : (
+              <Field label={t("admin.voucherCodeLabel")}>
+                <Input value={code} onChange={(e) => setCode(e.target.value)} placeholder="cth: HEMAT50" className="font-mono uppercase" />
+              </Field>
+            )}
             <Field label={t("admin.typeLabel")}>
               <Select value={type} onChange={setType} options={VOUCHER_TYPES} className="h-10 w-full text-sm" ariaLabel={t("admin.voucherTypeAria")} />
             </Field>
@@ -1245,6 +1683,10 @@ function VouchersTab() {
                 <Select value={planId} onChange={setPlanId} options={planOptions} className="h-10 w-full text-sm" ariaLabel={t("admin.packageIdLabel")} />
               </Field>
             )}
+            <Field label={t("admin.voucherMinPlanLabel")}>
+              <Select value={minPlanId} onChange={setMinPlanId} options={minPlanOptions} className="h-10 w-full text-sm" ariaLabel={t("admin.voucherMinPlanLabel")} />
+              <p className="mt-1 text-xs text-muted-foreground">{t("admin.voucherMinPlanHint")}</p>
+            </Field>
             <div className="grid grid-cols-2 gap-3">
               <Field label={t("admin.durationLabel")}>
                 <Input type="number" min="0" value={duration} onChange={(e) => setDuration(e.target.value)} />
@@ -1253,11 +1695,146 @@ function VouchersTab() {
                 <Input type="number" min="1" value={maxUses} onChange={(e) => setMaxUses(e.target.value)} />
               </Field>
             </div>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label={t("admin.voucherStartsAtLabel")}>
+                <Input type="datetime-local" value={startsAt} onChange={(e) => setStartsAt(e.target.value)} />
+              </Field>
+              <Field label={t("admin.voucherEndsAtLabel")}>
+                <Input type="datetime-local" value={endsAt} onChange={(e) => setEndsAt(e.target.value)} />
+              </Field>
+            </div>
+            <label className="flex items-start gap-2 text-sm text-foreground cursor-pointer">
+              <input type="checkbox" checked={newUsersOnly} onChange={(e) => setNewUsersOnly(e.target.checked)} className="w-4 h-4 accent-primary mt-0.5" />
+              <span>
+                {t("admin.voucherNewUsersOnly")}
+                <span className="block text-xs text-muted-foreground">{t("admin.voucherNewUsersOnlyHint")}</span>
+              </span>
+            </label>
+            <div className="rounded-lg border border-border bg-muted/50 p-3 space-y-1.5">
+              <p className="text-xs font-semibold text-foreground">{t("admin.voucherPreviewTitle")}</p>
+              <p className="text-sm text-muted-foreground">{previewSummary}</p>
+              <dl className="space-y-1 pt-1 text-sm">
+                <div className="flex items-center justify-between gap-3">
+                  <dt className="text-muted-foreground">{t("admin.voucherCodeLabel")}</dt>
+                  <dd className="font-mono font-medium text-foreground">{previewCode}</dd>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <dt className="text-muted-foreground">{t("admin.typeLabel")}</dt>
+                  <dd className="font-medium text-foreground">{typeLabel(type)}</dd>
+                </div>
+                {type === "plan" && (
+                  <div className="flex items-center justify-between gap-3">
+                    <dt className="text-muted-foreground">{t("admin.packageIdLabel")}</dt>
+                    <dd className="font-medium text-foreground text-right">
+                      {previewPlan ? `${previewPlan.name} — ${fmtRp(previewPlan.price)}` : t("admin.voucherPreviewNoPlan")}
+                    </dd>
+                  </div>
+                )}
+                <div className="flex items-center justify-between gap-3">
+                  <dt className="text-muted-foreground">{t("admin.durationLabel")}</dt>
+                  <dd className="font-medium text-foreground">
+                    {previewDaysNum > 0 ? t("admin.daysCount").replace("{count}", String(previewDaysNum)) : "—"}
+                  </dd>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <dt className="text-muted-foreground">{t("admin.maxUsesLabel")}</dt>
+                  <dd className="font-medium text-foreground">
+                    {previewUsesNum > 0 ? t("admin.voucherPreviewUses").replace("{count}", fmtNum(previewUsesNum)) : "—"}
+                  </dd>
+                </div>
+                {(startsAt || endsAt) && (
+                  <div className="flex items-center justify-between gap-3">
+                    <dt className="text-muted-foreground">{t("admin.colSchedule")}</dt>
+                    <dd className="font-medium text-foreground text-right">
+                      {startsAt ? fmtDate(startsAt) : "…"} – {endsAt ? fmtDate(endsAt) : "…"}
+                    </dd>
+                  </div>
+                )}
+                {newUsersOnly && (
+                  <div className="flex items-center justify-between gap-3">
+                    <dt className="text-muted-foreground">{t("admin.voucherNewUsersOnly")}</dt>
+                    <dd className="font-medium text-foreground text-right">Ya</dd>
+                  </div>
+                )}
+                {minPlanId && (
+                  <div className="flex items-center justify-between gap-3">
+                    <dt className="text-muted-foreground">{t("admin.voucherMinPlanLabel")}</dt>
+                    <dd className="font-medium text-foreground text-right">{minPlanName(Number(minPlanId)) ?? `#${minPlanId}`}</dd>
+                  </div>
+                )}
+              </dl>
+            </div>
             <div className="flex justify-end gap-2">
-              <Button variant="outline" size="sm" onClick={() => setShowForm(false)}>
+              <Button variant="outline" size="sm" onClick={closeForm}>
                 {t("admin.cancel")}
               </Button>
-              <Button size="sm" onClick={handleAdd} disabled={saving}>
+              <Button size="sm" onClick={bulkMode ? handleBulk : handleAdd} disabled={saving}>
+                {saving ? t("admin.saving") : t("admin.save")}
+              </Button>
+            </div>
+            {bulkResult && (
+              <div className="rounded-lg border border-border p-3 space-y-2 text-sm">
+                <p className="font-medium">
+                  {t("admin.bulkResultCreated").replace("{count}", String(bulkResult.createdCount))}
+                  {" · "}
+                  {t("admin.bulkResultFailed").replace("{count}", String(bulkResult.failedCount))}
+                </p>
+                {bulkResult.failed.length > 0 && (
+                  <ul className="space-y-1">
+                    {bulkResult.failed.map((f) => (
+                      <li key={f.code} className="flex justify-between gap-2 text-xs">
+                        <span className="font-mono font-semibold">{f.code}</span>
+                        <span className="text-muted-foreground text-right">{f.reason}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+          </div>
+        </Modal>
+      )}
+
+      {editing && (
+        <Modal title={t("admin.editVoucherTitle")} onClose={() => setEditing(null)}>
+          <div className="space-y-4">
+            {editingUsed && (
+              <p className="text-xs leading-relaxed rounded-md border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 px-3 py-2">
+                {t("admin.voucherLockedNote").replace("{count}", String(editing.usedCount))}
+              </p>
+            )}
+            <Field label={t("admin.voucherCodeLabel")}>
+              <Input value={code} onChange={(e) => setCode(e.target.value)} placeholder="cth: HEMAT50" className="font-mono uppercase" disabled={editingUsed} />
+            </Field>
+            <Field label={t("admin.typeLabel")}>
+              <Select value={type} onChange={setType} options={editTypeOptions} className="h-10 w-full text-sm" ariaLabel={t("admin.voucherTypeAria")} disabled={editingUsed} />
+            </Field>
+            {type === "plan" && (
+              <Field label={t("admin.packageIdLabel")}>
+                <Select value={planId} onChange={setPlanId} options={planOptions} className="h-10 w-full text-sm" ariaLabel={t("admin.packageIdLabel")} disabled={editingUsed} />
+              </Field>
+            )}
+            <div className="grid grid-cols-2 gap-3">
+              <Field label={t("admin.durationLabel")}>
+                <Input type="number" min="0" value={duration} onChange={(e) => setDuration(e.target.value)} disabled={editingUsed} />
+              </Field>
+              <Field label={t("admin.maxUsesLabel")}>
+                <Input type="number" min="1" value={maxUses} onChange={(e) => setMaxUses(e.target.value)} disabled={editingUsed} />
+              </Field>
+            </div>
+            <Field label={t("admin.expiresAtLabel")}>
+              <Input type="date" value={editExpiresAt} onChange={(e) => setEditExpiresAt(e.target.value)} />
+              <p className="text-xs text-muted-foreground mt-1">{t("admin.expiresAtHint")}</p>
+            </Field>
+            <label className="flex items-center gap-2 text-sm text-foreground cursor-pointer">
+              <input type="checkbox" checked={editIsActive} onChange={(e) => setEditIsActive(e.target.checked)} className="w-4 h-4 accent-primary" />
+              {t("admin.voucherActiveLabel")}
+            </label>
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" size="sm" onClick={() => setEditing(null)}>
+                {t("admin.cancel")}
+              </Button>
+              <Button size="sm" onClick={handleSaveEdit} disabled={saving}>
                 {saving ? t("admin.saving") : t("admin.save")}
               </Button>
             </div>
@@ -1278,6 +1855,49 @@ function VouchersTab() {
               {deletingBusy ? t("admin.deleting") : t("admin.delete")}
             </Button>
           </div>
+        </Modal>
+      )}
+
+      {historyVoucher && (
+        <Modal title={t("admin.voucherHistoryTitle").replace("{code}", historyVoucher.code)} onClose={() => setHistoryVoucher(null)}>
+          {historyLoading && <LoadingRows />}
+          {!historyLoading && historyError && <ErrorCard message={historyError} onRetry={() => loadHistory(historyVoucher)} />}
+          {!historyLoading && !historyError && history.length === 0 && (
+            <p className="text-sm text-muted-foreground">{t("admin.noRedemptions")}</p>
+          )}
+          {!historyLoading && !historyError && history.length > 0 && (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm min-w-[420px]">
+                <thead>
+                  <tr className="border-b border-border text-left text-xs text-muted-foreground">
+                    <th className="p-3 font-medium">{t("admin.colRedeemer")}</th>
+                    <th className="p-3 font-medium">{t("admin.colRedeemedAt")}</th>
+                    <th className="p-3 font-medium">{t("admin.colConverted")}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {history.map((h) => (
+                    <tr key={h.id} className="border-b border-border last:border-0">
+                      <td className="p-3">
+                        <p className="font-medium text-foreground">{h.userName}</p>
+                        <p className="text-xs text-muted-foreground">{h.userEmail}</p>
+                      </td>
+                      <td className="p-3 text-xs text-muted-foreground whitespace-nowrap">{fmtDate(h.redeemedAt)}</td>
+                      <td className="p-3">
+                        {h.converted ? (
+                          <Badge className="bg-emerald-500/10 text-emerald-600 border-emerald-500/20">
+                            {t("admin.convertedYes").replace("{date}", fmtDate(h.firstPaidAt))}
+                          </Badge>
+                        ) : (
+                          <Badge variant="outline">{t("admin.convertedNo")}</Badge>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </Modal>
       )}
     </div>
@@ -2153,6 +2773,7 @@ function actionLabel(t: (k: string) => string, a: string) {
     update_package: t("admin.actionUpdatePackage"),
     delete_package: t("admin.actionDeletePackage"),
     create_voucher: t("admin.actionCreateVoucher"),
+    update_voucher: t("admin.actionUpdateVoucher"),
     delete_voucher: t("admin.actionDeleteVoucher"),
     send_notification: t("admin.actionSendNotification"),
     broadcast_wa: t("admin.actionBroadcastWa"),

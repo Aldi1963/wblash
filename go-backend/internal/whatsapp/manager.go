@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Aldi1963/wagataway/internal/database/models"
+	"github.com/Aldi1963/wagataway/internal/drip"
 	"github.com/Aldi1963/wagataway/internal/realtime"
 	"github.com/Aldi1963/wagataway/internal/security"
 	"github.com/rs/zerolog/log"
@@ -876,6 +877,11 @@ func (m *Manager) handleIncomingMessage(sess *SessionState, msg *events.Message)
 		m.migrateLIDConversation(sess.UserID, sess.DeviceID, sender, senderPhone)
 	}
 
+	// Bot katalog + order via WA — dievaluasi SEBELUM menu bot: bila pelanggan
+	// sedang dalam sesi keranjang atau mengetik keyword katalog, pesan
+	// ditangani di sini agar tidak bentrok dengan menu/auto-reply/AI.
+	catalogHandled := m.checkCatalogBot(sess, senderJID, senderPhone, msg.Info.PushName, text, msg.Info.IsGroup)
+
 	// Chatbot menu bertingkat — dievaluasi DULU sebelum AI reply & auto-reply.
 	// Bila ia menangani pesan (sesi menu aktif / keyword cocok / selalu-aktif),
 	// keduanya dilewati agar tidak bentrok. Default nonaktif per device.
@@ -885,13 +891,13 @@ func (m *Manager) handleIncomingMessage(sess *SessionState, msg *events.Message)
 	// Dipanggil sebelum skip grup agar config dengan IgnoreGroups=false tetap jalan di grup.
 	// Di chat pribadi, auto-reply (rule eksplisit) menang atas AI reply agar pengirim
 	// tidak menerima dua balasan sekaligus; AI menjadi fallback bila tak ada rule yang cocok.
-	if !menuHandled {
+	if !menuHandled && !catalogHandled {
 		if msg.Info.IsGroup {
-			go m.checkAIReply(sess, senderJID, text, true)
+			go m.checkAIReply(sess, senderJID, senderPhone, text, true)
 		} else if m.findAutoReplyRule(sess, text) != nil {
-			go m.checkAutoReply(sess, senderJID, text)
+			go m.checkAutoReply(sess, senderJID, senderPhone, text)
 		} else {
-			go m.checkAIReply(sess, senderJID, text, false)
+			go m.checkAIReply(sess, senderJID, senderPhone, text, false)
 		}
 	}
 
@@ -930,7 +936,19 @@ func (m *Manager) handleIncomingMessage(sess *SessionState, msg *events.Message)
 	m.db.Create(&inbox)
 
 	// Update or create conversation
+	// Drip berbasis aksi: kontak baru = belum ada percakapan sebelumnya.
+	var existingConv models.ChatConversation
+	isNewContact := m.db.Where("user_id = ? AND device_id = ? AND phone = ?",
+		sess.UserID, sess.DeviceID, senderPhone).First(&existingConv).Error != nil
 	m.updateConversation(sess, senderPhone, senderJID, msg.Info.PushName, text, getMessageType(msg))
+
+	// Drip berbasis aksi (non-blocking, gagal diam-diam): STOP/balasan,
+	// pesan pertama kontak baru, dan keyword.
+	go func() {
+		if err := drip.HandleIncoming(m.db, sess.UserID, sess.DeviceID, senderPhone, text, isNewContact); err != nil {
+			log.Error().Err(err).Msg("Drip trigger gagal")
+		}
+	}()
 
 	// Fire webhook
 	go m.fireWebhooks(sess.UserID, sess.DeviceID, "message.received", map[string]interface{}{
@@ -1172,7 +1190,7 @@ func (m *Manager) findAutoReplyRule(sess *SessionState, text string) *models.Aut
 }
 
 // checkAutoReply checks if an incoming message matches any auto-reply rules
-func (m *Manager) checkAutoReply(sess *SessionState, senderJID, text string) {
+func (m *Manager) checkAutoReply(sess *SessionState, senderJID, senderPhone, text string) {
 	rule := m.findAutoReplyRule(sess, text)
 	if rule == nil {
 		return
@@ -1185,6 +1203,7 @@ func (m *Manager) checkAutoReply(sess *SessionState, senderJID, text string) {
 		log.Error().Err(err).Uint("ruleID", rule.ID).Msg("Auto-reply failed")
 	} else {
 		log.Info().Uint("ruleID", rule.ID).Str("to", senderJID).Msg("Auto-reply sent")
+		m.RecordFirstResponse(sess.UserID, sess.DeviceID, senderPhone)
 	}
 }
 
@@ -1196,7 +1215,7 @@ func (m *Manager) updateConversation(sess *SessionState, phone, senderJID, pushN
 
 	now := time.Now()
 	if result.Error != nil {
-		// Create new conversation
+		// Create new conversation — pesan masuk ini memulai episode FRT.
 		conv = models.ChatConversation{
 			UserID:          sess.UserID,
 			DeviceID:        sess.DeviceID,
@@ -1207,6 +1226,7 @@ func (m *Manager) updateConversation(sess *SessionState, phone, senderJID, pushN
 			LastMessageType: msgType,
 			UnreadCount:     1,
 			LastActivity:    now,
+			FirstInboundAt:  &now,
 		}
 		m.db.Create(&conv)
 	} else {
@@ -1221,8 +1241,47 @@ func (m *Manager) updateConversation(sess *SessionState, phone, senderJID, pushN
 		if senderJID != "" {
 			updates["sender_j_id"] = senderJID
 		}
+		// CS multi-agent: pesan masuk pertama yang belum dibalas memulai
+		// pengukuran first response time (FRT).
+		if conv.FirstInboundAt == nil {
+			updates["first_inbound_at"] = now
+		}
+		// Pesan masuk baru di percakapan yang sudah resolved/done membuka
+		// lagi percakapan itu dan memulai ulang episode FRT. (Expr("NULL"):
+		// GORM Updates(map) melewati nilai nil untuk *time.Time.)
+		if conv.Status == "resolved" || conv.Status == "done" {
+			updates["status"] = "open"
+			updates["resolved_at"] = gorm.Expr("NULL")
+			updates["resolution_secs"] = gorm.Expr("NULL")
+			updates["first_inbound_at"] = now
+			updates["first_response_at"] = gorm.Expr("NULL")
+			updates["first_response_secs"] = gorm.Expr("NULL")
+		}
 		m.db.Model(&conv).Updates(updates)
 	}
+}
+
+// RecordFirstResponse mencatat balasan pertama CS atas episode FRT yang
+// sedang berjalan: FirstResponseAt + durasi detik sejak FirstInboundAt.
+// No-op bila tidak ada episode berjalan atau sudah ada balasan pertama.
+func (m *Manager) RecordFirstResponse(userID, deviceID uint, phone string) {
+	var conv models.ChatConversation
+	if err := m.db.Where("user_id = ? AND device_id = ? AND phone = ?",
+		userID, deviceID, phone).First(&conv).Error; err != nil {
+		return
+	}
+	if conv.FirstInboundAt == nil || conv.FirstResponseAt != nil {
+		return
+	}
+	now := time.Now()
+	secs := int(now.Sub(*conv.FirstInboundAt).Seconds())
+	if secs < 0 {
+		secs = 0
+	}
+	m.db.Model(&conv).Updates(map[string]interface{}{
+		"first_response_at":   now,
+		"first_response_secs": secs,
+	})
 }
 
 // migrateLIDConversation memindahkan percakapan + pesan inbox dari kunci LID
@@ -1291,6 +1350,13 @@ func (m *Manager) BackfillLIDConversations(userID, deviceID uint) int {
 		}
 	}
 	return migrated
+}
+
+// FireEvent memicu webhook outbound untuk satu event dari luar paket
+// whatsapp (mis. subscription.activated dari billing). Pengiriman tiap hook
+// berjalan di goroutine sendiri di dalam fireWebhooks.
+func (m *Manager) FireEvent(userID, deviceID uint, event string, payload map[string]interface{}) {
+	m.fireWebhooks(userID, deviceID, event, payload)
 }
 
 // fireWebhooks fires all active webhooks for a user/device event.

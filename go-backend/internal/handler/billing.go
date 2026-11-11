@@ -11,8 +11,8 @@ import (
 	"github.com/Aldi1963/wagataway/internal/config"
 	"github.com/Aldi1963/wagataway/internal/database/models"
 	"github.com/Aldi1963/wagataway/internal/middleware"
-	"github.com/Aldi1963/wagataway/internal/rls"
 	"github.com/Aldi1963/wagataway/internal/quota"
+	"github.com/Aldi1963/wagataway/internal/rls"
 	"github.com/Aldi1963/wagataway/internal/subscription"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -42,6 +42,8 @@ func registerBillingRoutes(rg *gin.RouterGroup, cfg *config.Config, db *gorm.DB,
 		b.GET("/transactions/:id/invoice.pdf", getInvoicePDF(db))
 		b.POST("/voucher/redeem", redeemVoucher(db))
 		b.GET("/voucher/redemptions", listVoucherRedemptions(db))
+		// Tagihan pelanggan (Item 3): invoice + QRIS Clipku Pay di WA.
+		registerCustomerInvoiceRoutes(b, cfg, db, wm)
 	}
 }
 
@@ -79,7 +81,7 @@ func getSubscription(db *gorm.DB) gin.HandlerFunc {
 		}
 		c.JSON(http.StatusOK, gin.H{"subscription": subscriptionWithState{
 			Subscription: sub,
-			SubState:      subState,
+			SubState:     subState,
 		}})
 	}
 }
@@ -193,6 +195,8 @@ func createSubscription(cfg *config.Config, db *gorm.DB, wm waSender) gin.Handle
 				// Fitur 6: tepat di momen transisi → paid (prorata bayar-0).
 				// Error notifikasi tidak menggagalkan aktivasi.
 				_ = notifyPaymentSuccess(udb, wm, tx.ID)
+				// Item 8: event webhook outbound subscription.activated.
+				fireSubscriptionActivated(udb, wm, tx.ID)
 			}
 			c.JSON(http.StatusCreated, gin.H{
 				"transaction": tx,
@@ -284,6 +288,8 @@ func getBillingTransaction(cfg *config.Config, db *gorm.DB, wm waSender) gin.Han
 						// notifikasi tidak menggagalkan sinkronisasi.
 						if activated, _ := activateSubscription(udb, tx.ID); activated {
 							_ = notifyPaymentSuccess(udb, wm, tx.ID)
+							// Item 8: event webhook outbound subscription.activated.
+							fireSubscriptionActivated(udb, wm, tx.ID)
 						}
 						udb.Where("id = ?", tx.ID).Preload("Plan").First(&tx)
 					}
@@ -334,6 +340,10 @@ var errAlreadyRedeemed = errors.New("voucher already redeemed by user")
 // (terdeteksi di dalam transaksi, setelah kunci baris).
 var errVoucherExhausted = errors.New("voucher exhausted")
 
+// errVoucherNewUsersOnly menandai percobaan redeem voucher khusus
+// pengguna baru oleh user yang masih punya langganan aktif.
+var errVoucherNewUsersOnly = errors.New("voucher khusus pengguna baru")
+
 func redeemVoucher(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		userID := middleware.GetUserID(c)
@@ -370,12 +380,41 @@ func redeemVoucher(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
+		// Jendela berlaku (Item 3): berlaku DI SAMPING ExpiresAt — pesan
+		// dibedakan dari "sudah kadaluarsa" supaya admin/user tahu ini
+		// soal jadwal mulai/berakhir, bukan tanggal kedaluwarsa voucher.
+		now := java_time_now()
+		if voucher.StartsAt != nil && now.Before(*voucher.StartsAt) {
+			c.JSON(http.StatusForbidden, gin.H{"message": "Voucher belum berlaku"})
+			return
+		}
+		if voucher.EndsAt != nil && now.After(*voucher.EndsAt) {
+			c.JSON(http.StatusGone, gin.H{"message": "Voucher sudah berakhir"})
+			return
+		}
+
 		// Voucher diskon belum punya mekanisme penerapan (tidak ada tempat
 		// menyimpan diskon untuk pembayaran berikutnya) — tolak dengan jelas
 		// daripada mencatat penukaran yang tidak memberi apa-apa.
 		if voucher.Type == "discount" {
 			c.JSON(http.StatusBadRequest, gin.H{"message": "Voucher diskon belum dapat digunakan"})
 			return
+		}
+
+		// Voucher khusus pengguna baru: hanya untuk yang belum pernah
+		// berlangganan atau langganannya sudah habis (tidak ada langganan
+		// aktif saat ini). Dicek ulang di dalam transaksi di bawah agar
+		// aktivasi langganan yang berjalan bersamaan tidak lolos.
+		if voucher.NewUsersOnly {
+			active, err := subscription.HasActiveSubscription(udb, userID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "Gagal menggunakan voucher"})
+				return
+			}
+			if active {
+				c.JSON(http.StatusForbidden, gin.H{"message": "Voucher ini khusus pengguna baru atau yang langganannya sudah habis"})
+				return
+			}
 		}
 
 		// Siapkan paket yang akan diberikan (trial memakai paket acuan bila
@@ -386,9 +425,18 @@ func redeemVoucher(db *gorm.DB) gin.HandlerFunc {
 			return
 		}
 
+		// Paket minimal (MinPlanID): bandingkan dengan paket yang AKAN
+		// diberikan voucher ini — bukan paket user saat ini. Trial tanpa
+		// PlanID memberi paket Free (tier terendah), jadi voucher trial
+		// bermininum Pro otomatis ditolak; trial ber-PlanID Pro/Master
+		// lolos. Voucher diskon sudah ditolak di atas, tidak sampai sini.
+		if err := checkVoucherMinPlan(udb, &voucher, plan); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"message": err.Error()})
+			return
+		}
+
 		// Cek + catat redeem + increment used_count + terapkan efek voucher
 		// berjalan atomik dalam satu transaksi.
-		now := java_time_now()
 		var startsAt, endsAt time.Time
 		err = udb.Transaction(func(tx *gorm.DB) error {
 			var err error
@@ -402,6 +450,10 @@ func redeemVoucher(db *gorm.DB) gin.HandlerFunc {
 			}
 			if errors.Is(err, errAlreadyRedeemed) {
 				c.JSON(http.StatusConflict, gin.H{"message": "Voucher ini sudah pernah Anda gunakan"})
+				return
+			}
+			if errors.Is(err, errVoucherNewUsersOnly) {
+				c.JSON(http.StatusForbidden, gin.H{"message": "Voucher ini khusus pengguna baru atau yang langganannya sudah habis"})
 				return
 			}
 			c.JSON(http.StatusInternalServerError, gin.H{"message": "Gagal menggunakan voucher"})
@@ -448,6 +500,27 @@ func redeemVoucherTx(tx *gorm.DB, userID uint, voucher *models.Voucher, plan mod
 		return time.Time{}, time.Time{}, errVoucherExhausted
 	}
 
+	// Syarat pengguna baru dicek ulang di dalam transaksi: kunci baris
+	// user dulu agar aktivasi langganan yang berjalan bersamaan (mis.
+	// pembayaran paket lain yang commit di antara cek luar dan pemberian
+	// langganan di bawah) tidak lolos. Kunci ini juga dipakai
+	// grantVoucherSubscription di bawah — dalam satu transaksi yang sama,
+	// penguncian ulang baris yang sama adalah no-op.
+	if voucher.NewUsersOnly {
+		var lockedUser models.User
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ?", userID).First(&lockedUser).Error; err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+		active, err := subscription.HasActiveSubscription(tx, userID)
+		if err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+		if active {
+			return time.Time{}, time.Time{}, errVoucherNewUsersOnly
+		}
+	}
+
 	var count int64
 	if err := tx.Model(&models.VoucherRedemption{}).
 		Where("voucher_id = ? AND user_id = ?", voucher.ID, userID).
@@ -484,6 +557,40 @@ func redeemVoucherTx(tx *gorm.DB, userID uint, voucher *models.Voucher, plan mod
 
 	// Berikan langganan (mengantre bila sudah ada langganan aktif).
 	return grantVoucherSubscription(tx, userID, plan, durationDays, isTrial, now)
+}
+
+// planTierBelow melaporkan apakah paket yang diberikan tier-nya DI BAWAH
+// paket minimum. Tier diukur dari SortOrder — urutan kanonis paket yang
+// dipakai listPlans, adminListPackages, dan daftar paket publik. Data live
+// konsisten: SortOrder naik seiring harga (Free 1/0, Lite 2/25000, Regular
+// 3/66000, Pro 4/110000, Master 5/175000), jadi SortOrder saja sudah
+// menentukan tier; Price hanya penyeimbang bila dua paket berbagi
+// SortOrder yang sama (mis. paket baru yang belum diurutkan admin).
+func planTierBelow(granted, min models.Plan) bool {
+	if granted.SortOrder != min.SortOrder {
+		return granted.SortOrder < min.SortOrder
+	}
+	return granted.Price < min.Price
+}
+
+// checkVoucherMinPlan menolak redeem bila paket yang akan diberikan voucher
+// tier-nya di bawah paket minimal voucher (MinPlanID). Tanpa MinPlanID
+// voucher berlaku untuk semua paket. Bila baris paket minimum sudah tidak
+// ada lagi (dihapus admin setelah voucher dibuat), batas tidak bisa diukur
+// — voucher dianggap berlaku untuk semua paket, bukan ditolak, karena
+// penghapusan paket tidak seharusnya mematikan voucher yang sudah beredar.
+func checkVoucherMinPlan(udb *gorm.DB, voucher *models.Voucher, granted models.Plan) error {
+	if voucher.MinPlanID == nil {
+		return nil
+	}
+	var min models.Plan
+	if err := udb.Where("id = ?", *voucher.MinPlanID).First(&min).Error; err != nil {
+		return nil
+	}
+	if planTierBelow(granted, min) {
+		return fmt.Errorf("Voucher ini hanya berlaku untuk paket %s ke atas", min.Name)
+	}
+	return nil
 }
 
 // voucherGrantPlan menentukan paket + durasi + status trial yang diberikan

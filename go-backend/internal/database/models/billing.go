@@ -82,6 +82,10 @@ type Transaction struct {
 	Plan *Plan `gorm:"foreignKey:PlanID" json:"Plan,omitempty"`
 }
 
+// VoucherSourceReferralReward menandai voucher yang diterbitkan otomatis
+// sebagai hadiah referral (Item 9). Voucher buatan admin berisi "".
+const VoucherSourceReferralReward = "referral_reward"
+
 type Voucher struct {
 	ID        uint       `gorm:"primaryKey" json:"id"`
 	Code      string     `gorm:"size:50;uniqueIndex;not null" json:"code"`
@@ -91,8 +95,27 @@ type Voucher struct {
 	Discount  int        `gorm:"default:0" json:"discount"` // percentage
 	MaxUses   int        `gorm:"default:1" json:"maxUses"`
 	UsedCount int        `gorm:"default:0" json:"usedCount"`
+	// NewUsersOnly membatasi voucher hanya untuk pengguna yang belum pernah
+	// berlangganan ATAU langganannya sudah habis (tidak ada langganan aktif
+	// saat ini). Independen dari tipe voucher (trial maupun plan) dan dari
+	// syarat lain (masa berlaku, maks pakai, sudah pernah redeem). Voucher
+	// diskon tetap ditolak seperti biasa, terlepas dari flag ini.
+	NewUsersOnly bool      `gorm:"default:false" json:"newUsersOnly"`
 	IsActive  bool       `gorm:"default:true" json:"isActive"`
 	ExpiresAt *time.Time `json:"expiresAt"`
+	// Source: asal voucher — "" (dibuat admin) atau "referral_reward"
+	// (diterbitkan otomatis sebagai hadiah referral).
+	Source    string     `gorm:"size:20;default:''" json:"source"`
+	// Jendela berlaku (Item 3): voucher hanya bisa ditukar bila sekarang
+	// berada di dalam [StartsAt, EndsAt]. Keduanya opsional — sisi yang
+	// kosong tidak membatasi. Berlaku DI SAMPING ExpiresAt + durasi hari,
+	// bukan menggantikannya.
+	StartsAt *time.Time `json:"startsAt"`
+	EndsAt   *time.Time `json:"endsAt"`
+	// MinPlanID: paket minimal yang boleh memakai voucher ini. NULL =
+	// berlaku untuk semua paket. Tier diukur dari SortOrder paket
+	// (lihat planTierBelow di handler billing).
+	MinPlanID *uint      `json:"minPlanId"`
 	CreatedAt time.Time  `json:"createdAt"`
 	UpdatedAt time.Time  `json:"updatedAt"`
 }
@@ -129,4 +152,44 @@ type PaymentWebhookLog struct {
 	Payload   string    `gorm:"type:text" json:"payload"` // raw JSON
 	Status    string    `gorm:"size:20;default:received" json:"status"`
 	CreatedAt time.Time `json:"createdAt"`
+}
+
+// CustomerInvoiceItem adalah satu baris rincian tagihan pelanggan.
+type CustomerInvoiceItem struct {
+	Description string `json:"description"`
+	Qty         int    `json:"qty"`
+	Price       int64  `json:"price"` // harga satuan
+}
+
+// CustomerInvoice adalah tagihan ke PELANGGAN (bukan langganan WaGataway):
+// dibuat dari panel, dibayar via QRIS Clipku Pay, status lunas terdeteksi
+// otomatis lewat webhook yang sama dengan langganan (dicocokkan via
+// ExternalID + nominal, mode ketat). Items disimpan sebagai JSON di kolom
+// Items; ItemsList adalah hasil decode-nya (tidak disimpan).
+type CustomerInvoice struct {
+	ID            uint       `gorm:"primaryKey" json:"id"`
+	UserID        uint       `gorm:"index;not null" json:"userId"`
+	ContactID     *uint      `gorm:"index" json:"contactId,omitempty"`
+	CustomerName  string     `gorm:"size:255;not null" json:"customerName"`
+	CustomerPhone string     `gorm:"size:20;not null" json:"customerPhone"`
+	CustomerEmail string     `gorm:"size:255" json:"customerEmail,omitempty"`
+	Items         string     `gorm:"type:text;not null" json:"-"` // JSON []CustomerInvoiceItem
+	Amount        int64      `gorm:"not null" json:"amount"`      // total tagihan
+	Notes         string     `gorm:"type:text" json:"notes,omitempty"`
+	DueDate       *time.Time `json:"dueDate,omitempty"`
+	Status        string     `gorm:"size:20;default:pending" json:"status"` // pending, paid, expired, cancelled
+	ExternalID    string     `gorm:"size:255;uniqueIndex" json:"externalId"` // order ID Clipku Pay (WAG-INV-...), unik
+	PaymentURL    string     `gorm:"size:500" json:"paymentUrl,omitempty"`
+	QrURL         string     `gorm:"type:text" json:"qrUrl,omitempty"`
+	PaidAt        *time.Time `json:"paidAt,omitempty"`
+	SentAt        *time.Time `json:"sentAt,omitempty"` // terakhir dikirim via WA
+	CreatedAt     time.Time  `json:"createdAt"`
+	UpdatedAt     time.Time  `json:"updatedAt"`
+
+	// InvoiceNumber deterministik dari ID (tidak disimpan di DB), format
+	// INV-C/<tahun>/<bulan romawi>/<id 6 digit> — prefix C (customer) agar
+	// tidak bentrok visual dengan nomor kwitansi langganan (INV/...).
+	InvoiceNumber string `gorm:"-" json:"invoiceNumber"`
+	// ItemsList adalah Items yang sudah di-decode (tidak disimpan di DB).
+	ItemsList []CustomerInvoiceItem `gorm:"-" json:"items"`
 }

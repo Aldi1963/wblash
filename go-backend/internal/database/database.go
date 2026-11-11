@@ -57,6 +57,8 @@ func AutoMigrate(db *gorm.DB) error {
 		&models.AutoReply{},
 		&models.AIReplyConfig{},
 		&models.AIConnection{},
+		&models.AIChatbotFAQ{},
+		&models.AIChatbotLog{},
 		&models.ApiKey{},
 		&models.Plan{},
 		&models.Subscription{},
@@ -75,10 +77,12 @@ func AutoMigrate(db *gorm.DB) error {
 		&models.ChatInbox{},
 		&models.ChatConversation{},
 		&models.MessageTemplate{},
+		&models.MessageTemplateApproval{},
 		&models.EmailOtp{},
 		&models.PasswordResetToken{},
 		&models.WalletTransaction{},
 		&models.PaymentWebhookLog{},
+		&models.CustomerInvoice{},
 		&models.CannedResponse{},
 		&models.DripCampaign{},
 		&models.DripStep{},
@@ -87,11 +91,15 @@ func AutoMigrate(db *gorm.DB) error {
 		&models.ShortLink{},
 		&models.BotProduct{},
 		&models.BotOrder{},
+		&models.BotOrderItem{},
+		&models.BotCartSession{},
 		&models.AdminWaBot{},
 		&models.AdminActivityLog{},
 		&models.File{},
 		&models.ChatLabel{},
 		&models.ChatAssignment{},
+		&models.ChatInternalNote{},
+		&models.ChatActivity{},
 		&models.MessageReport{},
 		&models.RecurringSchedule{},
 		&models.GroupRule{},
@@ -100,6 +108,7 @@ func AutoMigrate(db *gorm.DB) error {
 		&models.TeamMember{},
 		&models.Affiliate{},
 		&models.AffiliateEarning{},
+		&models.ReferralReward{},
 		&models.MenuBot{},
 		&models.MenuBotItem{},
 		&models.MenuBotSession{},
@@ -108,9 +117,14 @@ func AutoMigrate(db *gorm.DB) error {
 		&models.PollVote{},
 		&models.Integration{},
 		&models.IntegrationLog{},
+		&models.SheetsConnection{},
+		&models.SheetsSync{},
+		&models.InboundWebhook{},
+		&models.InboundWebhookLog{},
 		&models.Session{},
 		&models.LoginHistory{},
 		&models.ChatReminder{},
+		&models.ChatBackup{},
 	); err != nil {
 		return err
 	}
@@ -129,7 +143,10 @@ func AutoMigrate(db *gorm.DB) error {
 	if err := migrateTransactionExternalIDUniqueIndex(db); err != nil {
 		return err
 	}
-	return migrateAPIKeyHashes(db)
+	if err := migrateAPIKeyHashes(db); err != nil {
+		return err
+	}
+	return migrateMessageTemplateGrandfather(db)
 }
 
 // migrateMessageIdempotencyUniqueIndex membuat unique index parsial untuk
@@ -257,11 +274,66 @@ func migrateAPIKeyHashes(db *gorm.DB) error {
 	return nil
 }
 
-// migratePlanQuotaDefaults mengisi monthly_message_limit (Fitur 3) untuk
-// paket bawaan yang masih 0 setelah kolom ditambahkan via AutoMigrate.
-// Idempoten; tidak menimpa nilai kustom. Master memang 0 (= unlimited).
+// migrateMessageTemplateGrandfather menganggap template yang sudah ada
+// sebelum alur persetujuan (kolom status baru, semua baris lama = draft)
+// sebagai sudah disetujui, agar TemplatePicker / Live Chat / kirim pesan
+// yang sudah memakainya tidak tiba-tiba rusak. Satu baris riwayat
+// "approved" ditulis per template. Idempoten via kunci di tabel settings:
+// hanya berjalan sekali, pada boot pertama sesudah deploy — template draft
+// yang dibuat sesudah itu TIDAK ikut di-approve otomatis.
+func migrateMessageTemplateGrandfather(db *gorm.DB) error {
+	const flagKey = "templates_approval_grandfathered_v1"
+	var flag models.Setting
+	if err := db.Where("key = ?", flagKey).First(&flag).Error; err == nil {
+		return nil
+	}
+	var templates []models.MessageTemplate
+	if err := db.Where("status = ?", "draft").Find(&templates).Error; err != nil {
+		return err
+	}
+	if len(templates) == 0 {
+		return db.Where("key = ?", flagKey).Assign(models.Setting{Key: flagKey, Value: "1"}).
+			FirstOrCreate(&models.Setting{}).Error
+	}
+	var users []models.User
+	if err := db.Select("id", "name").Find(&users).Error; err != nil {
+		return err
+	}
+	names := map[uint]string{}
+	for _, u := range users {
+		names[u.ID] = u.Name
+	}
+	for _, tpl := range templates {
+		actor := names[tpl.UserID]
+		if actor == "" {
+			actor = "Sistem"
+		}
+		if err := db.Model(&models.MessageTemplate{}).Where("id = ?", tpl.ID).
+			Update("status", "approved").Error; err != nil {
+			return err
+		}
+		if err := db.Create(&models.MessageTemplateApproval{
+			TemplateID: tpl.ID, UserID: tpl.UserID, ActorName: actor,
+			Action: "approved", FromStatus: "draft", ToStatus: "approved",
+			Reason: "Template lama: dianggap sudah disetujui (migrasi ke alur persetujuan).",
+		}).Error; err != nil {
+			return err
+		}
+	}
+	log.Info().Int("count", len(templates)).Msg("Grandfathered legacy message templates to approved")
+	return db.Where("key = ?", flagKey).Assign(models.Setting{Key: flagKey, Value: "1"}).
+		FirstOrCreate(&models.Setting{}).Error
+}
+
+// migratePlanQuotaDefaults mengisi monthly_message_limit (Fitur 3) dan
+// batas kontak/bulk/auto-reply (Item 7) untuk paket bawaan.
+// Idempoten; tidak menimpa nilai kustom. Master memang 0 (= unlimited)
+// untuk kuota pesan.
 func migratePlanQuotaDefaults(db *gorm.DB) error {
 	if err := quota.BackfillDefaults(db); err != nil {
+		return err
+	}
+	if err := quota.BackfillPlanLimits(db); err != nil {
 		return err
 	}
 	log.Info().Msg("Plan monthly message limits backfilled")
